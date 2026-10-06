@@ -28,6 +28,7 @@ import { useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectLoans } from '@/stores/loanSlice';
 import {
   DB_NAME,
   DB_VERSION,
@@ -40,7 +41,6 @@ import {
 } from '@/utils/db';
 import {
   buildArraySummaries,
-  buildBackupPayload,
   countPayload,
   exportBackupJson,
   importBackup,
@@ -52,7 +52,7 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0, loans: 0 };
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -62,6 +62,7 @@ export default function GeometryView() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const loans = useAppSelector(selectLoans);
 
   const [selectedArrayId, setSelectedArrayId] = useState<string | null>(null);
   const [counts, setCounts] = useState<CountMap>(EMPTY_COUNTS);
@@ -86,7 +87,7 @@ export default function GeometryView() {
   useEffect(() => {
     void refresh();
     // 数据变化后刷新统计
-  }, [arrays, stations, instruments, calibrations, replaces]);
+  }, [arrays, stations, instruments, calibrations, replaces, loans]);
 
   const activeArrayId = selectedArrayId ?? arrays[0]?.id ?? null;
   const activeArray = arrays.find((row) => row.id === activeArrayId) ?? null;
@@ -106,9 +107,10 @@ export default function GeometryView() {
       instruments,
       calibrations,
       replaces,
+      loans,
     };
     return buildArraySummaries(payload);
-  }, [arrays, calibrations, instruments, replaces, stations]);
+  }, [arrays, calibrations, instruments, loans, replaces, stations]);
 
   const activeSummary = summaries.find((row) => row.arrayId === activeArrayId) ?? null;
 
@@ -233,7 +235,7 @@ export default function GeometryView() {
     const text = summaries
       .map(
         (row) =>
-          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，仪器 ${row.instrumentCount} 台，登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，累计标定 ${row.calibrationCount} 次，不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 台，未闭环更换 ${row.pendingReplaceCount} 条。`
+          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，在账 ${row.instrumentCount} 台（借入 ${row.borrowedInCount}），登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，累计标定 ${row.calibrationCount} 次，不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 台，按期标定率 ${row.onScheduleRate}%，借出未归还 ${row.lentOutCount} 台（在途 ${row.inTransitCount}），挂起 ${row.suspendedCount} 台，未闭环更换 ${row.pendingReplaceCount} 条。`
       )
       .join('\n');
     try {
@@ -284,6 +286,7 @@ export default function GeometryView() {
         <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />
+        <StatBadge label="借调单" value={counts.loans} suffix="张" tone="info" />
       </div>
 
       {!activeArray || !activeSummary ? (
@@ -359,8 +362,9 @@ export default function GeometryView() {
                 </Descriptions.Item>
                 <Descriptions.Item label="管理部门">{activeSummary.department || '未填写'}</Descriptions.Item>
                 <Descriptions.Item label="布设日期">{activeSummary.deployDate}</Descriptions.Item>
-                <Descriptions.Item label="台站数 / 仪器数">
+                <Descriptions.Item label="台站数 / 在账台数">
                   {activeSummary.stationCount} / {activeSummary.instrumentCount}
+                  {activeSummary.borrowedInCount > 0 ? `（借入 ${activeSummary.borrowedInCount}）` : ''}
                 </Descriptions.Item>
                 <Descriptions.Item label="登记 / 实算孔径">
                   {activeSummary.recordedApertureKm} km / <b>{activeSummary.computedApertureKm} km</b>
@@ -387,6 +391,10 @@ export default function GeometryView() {
                 </Descriptions.Item>
                 <Descriptions.Item label="超期未标定 / 未闭环更换">
                   {activeSummary.overdueCount} 台 / {activeSummary.pendingReplaceCount} 条
+                </Descriptions.Item>
+                <Descriptions.Item label="按期标定率 / 借调">
+                  {activeSummary.onScheduleRate}% · 借出未归还 {activeSummary.lentOutCount}（在途{' '}
+                  {activeSummary.inTransitCount}）{activeSummary.suspendedCount > 0 ? ` · 挂起 ${activeSummary.suspendedCount}` : ''}
                 </Descriptions.Item>
                 <Descriptions.Item label="结论">{activeSummary.conclusion}</Descriptions.Item>
               </Descriptions>
@@ -426,7 +434,7 @@ export default function GeometryView() {
           columns={[
             { title: '台阵', dataIndex: 'arrayName', width: 180 },
             { title: '状态', dataIndex: 'state', width: 90, render: (value: string) => <Tag>{value}</Tag> },
-            { title: '台站 / 仪器', width: 120, align: 'right', render: (_: unknown, row) => (
+            { title: '台站 / 在账', width: 120, align: 'right', render: (_: unknown, row) => (
               <span className="gb-mono">{row.stationCount} / {row.instrumentCount}</span>
             ) },
             {
@@ -460,9 +468,16 @@ export default function GeometryView() {
             {
               title: '超期台数',
               dataIndex: 'overdueCount',
-              width: 100,
+              width: 90,
               align: 'right',
               render: (value: number) => <span className={value > 0 ? 'gb-danger gb-mono' : 'gb-mono'}>{value}</span>,
+            },
+            {
+              title: '按期标定率',
+              dataIndex: 'onScheduleRate',
+              width: 100,
+              align: 'right',
+              render: (value: number) => <span className="gb-mono">{value}%</span>,
             },
             { title: '结论', dataIndex: 'conclusion', ellipsis: true },
           ]}
@@ -511,7 +526,7 @@ export default function GeometryView() {
           </Descriptions>
           <p className="gb-hint">
             数据仅保存在当前浏览器 IndexedDB（{DB_NAME}）中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON
-            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces 五张表。
+            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces / loans 六张表。
           </p>
         </Space>
       </Card>

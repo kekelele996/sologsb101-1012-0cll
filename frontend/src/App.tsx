@@ -12,6 +12,7 @@ import {
   GlobalOutlined,
   SwapOutlined,
   ThunderboltOutlined,
+  CarOutlined,
 } from '@ant-design/icons';
 import { ROUTES } from '@/router';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
@@ -30,6 +31,7 @@ import {
   selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import { selectLoans, selectOpenLoans, startLoanSubscription } from '@/stores/loanSlice';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -38,6 +40,7 @@ const { Header, Sider, Content, Footer } = Layout;
 function buildSelectedKey(pathname: string, currentArrayId: string | null): string {
   if (pathname.startsWith('/calibrations')) return ROUTES.calibrations;
   if (pathname.startsWith('/replacements')) return ROUTES.replacements;
+  if (pathname.startsWith('/loans')) return ROUTES.loans;
   if (pathname.startsWith('/geometry')) return ROUTES.geometry;
   if (pathname.startsWith('/stations/') && currentArrayId) return ROUTES.stations(currentArrayId);
   return ROUTES.arrays;
@@ -54,6 +57,8 @@ export default function App() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const loans = useAppSelector(selectLoans);
+  const openLoans = useAppSelector(selectOpenLoans);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
   const ready = useAppSelector((state) => state.array.ready);
 
@@ -67,6 +72,7 @@ export default function App() {
         startArraySubscription(dispatch);
         startInstrumentSubscription(dispatch);
         startCalibrationSubscription(dispatch);
+        startLoanSubscription(dispatch);
       } catch (error) {
         if (cancelled) return;
         messageApi.error(
@@ -83,6 +89,7 @@ export default function App() {
   const selectedKey = buildSelectedKey(location.pathname, currentArrayId);
   const unqualified = calibrations.filter((row) => row.responseVerdict === '不合格').length;
   const pendingReplaces = replaces.filter((row) => row.state !== '已复核').length;
+  const inTransit = loans.filter((row) => row.state === '在途').length;
 
   return (
     <>
@@ -118,6 +125,7 @@ export default function App() {
               },
               { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台' },
               { key: ROUTES.replacements, icon: <SwapOutlined />, label: '合格评定与更换' },
+              { key: ROUTES.loans, icon: <CarOutlined />, label: '仪器周转库' },
               { key: ROUTES.geometry, icon: <GlobalOutlined />, label: '台阵几何与备份' },
             ]}
           />
@@ -134,6 +142,9 @@ export default function App() {
               </span>
               <span>
                 <SwapOutlined /> 更换未闭环 {pendingReplaces}
+              </span>
+              <span>
+                <CarOutlined /> 借调在途 {inTransit} · 未结 {openLoans.length}
               </span>
             </Space>
           </div>

@@ -52,8 +52,9 @@ import {
   type Replace,
   type ReplaceState,
 } from '@/types/replace';
-import { daysUntilDue, type Instrument } from '@/types/instrument';
+import { type Instrument } from '@/types/instrument';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
+import { useSerialRegistry } from '@/hooks/useSerialRegistry';
 import { initDatabase } from '@/utils/db';
 
 interface ReplaceFormValues {
@@ -92,6 +93,7 @@ export default function ReplaceBoard() {
   const replaces = useAppSelector(selectReplaces);
   const filter = useAppSelector(selectReplaceFilter);
   const { histories } = useCalibHistory();
+  const registry = useSerialRegistry();
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -102,35 +104,38 @@ export default function ReplaceBoard() {
     if (arrays.length === 0) void initDatabase();
   }, [arrays.length]);
 
-  /** 仪器评定行：结合标定结论与更换记录 */
+  /** 仪器评定行：仅在账（统一对账口径），在途 / 挂起不参评 */
   const rows = useMemo<AssessmentRow[]>(() => {
-    return instruments
-      .map((instrument) => {
-        const station = stations.find((row) => row.id === instrument.stationId);
-        const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
-        const own = calibrations
+    const mapped: AssessmentRow[] = [];
+    registry.entries.forEach((entry) => {
+      if (entry.suspended || !entry.instrument) return;
+      const custody = entry.custody;
+      if (!custody || custody.kind !== 'array') return;
+      const instrument = entry.instrument;
+      const station = stations.find((row) => row.id === custody.stationId);
+      const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
+      const latest = entry.latestCalibration;
+      const lastDate = latest ? latest.date : instrument.installDate;
+      const replace =
+        replaces
           .filter((row) => row.instrumentId === instrument.id)
-          .sort((a, b) => b.date.localeCompare(a.date));
-        const latest = own[0];
-        const lastDate = latest ? latest.date : instrument.installDate;
-        const dueInDays = daysUntilDue(lastDate, instrument.installDate);
-        const replace =
-          replaces
-            .filter((row) => row.instrumentId === instrument.id)
-            .sort((a, b) => b.date.localeCompare(a.date))[0] ?? null;
-        return {
-          instrument,
-          stationCode: station?.code ?? '未知台站',
-          arrayId: array?.id ?? '',
-          arrayName: array?.name ?? '未知台阵',
-          lastDate,
-          dueInDays,
-          overdue: dueInDays < 0,
-          lastVerdict: latest ? latest.responseVerdict : '待判定',
-          calibrationCount: own.length,
-          replace,
-        };
-      })
+          .sort((a, b) => b.date.localeCompare(a.date))[0] ?? null;
+      mapped.push({
+        instrument,
+        stationCode: station?.code ?? '未知台站',
+        arrayId: array?.id ?? custody.arrayId,
+        arrayName: array?.name ?? '未知台阵',
+        lastDate,
+        dueInDays: entry.dueInDays,
+        // 借调未归还不进超期：overdue 已由统一对账给出
+        overdue: entry.overdue,
+        lastVerdict: latest ? latest.responseVerdict : '待判定',
+        calibrationCount: calibrations.filter((row) => row.instrumentId === instrument.id).length,
+        replace,
+      });
+    });
+
+    return mapped
       .filter((row) => {
         const keyword = filter.keyword.trim();
         if (keyword.length > 0) {
@@ -145,7 +150,7 @@ export default function ReplaceBoard() {
         return true;
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, filter, instruments, replaces, stations]);
+  }, [arrays, calibrations, filter, registry, replaces, stations]);
 
   const totals = useMemo(() => {
     const overdue = rows.filter((row) => row.overdue).length;
@@ -254,8 +259,10 @@ export default function ReplaceBoard() {
     );
   };
 
-  /** 超期仪器提醒（标定周期 365 天） */
-  const overdueHistories = histories.filter((history) => history.overdue);
+  /** 超期仪器提醒：借调单未归还（在途 / 在借）的不进超期名单 */
+  const overdueHistories = histories.filter(
+    (history) => history.overdue && !registry.bySerial.get(history.instrument.serialNo)?.overdueSuspended
+  );
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -309,8 +316,21 @@ export default function ReplaceBoard() {
             .join('；')}
         />
       ) : (
-        <Alert type="success" showIcon message="全部仪器均在标定周期内，无需特别提醒" />
+        <Alert type="success" showIcon message="全部在账仪器均在标定周期内，无需特别提醒" />
       )}
+
+      {registry.inTransit.length > 0 || registry.suspended.length > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          message={
+            <>
+              {registry.inTransit.length > 0 ? `${registry.inTransit.length} 台已出库在途（接收台阵未登记安装位），两边不在账、不参评；` : ''}
+              {registry.suspended.length > 0 ? `${registry.suspended.length} 台序列号对账挂起，只退出这一台，不计超期。` : ''}
+            </>
+          }
+        />
+      ) : null}
 
       <FilterBar
         modelValue={filterModel}

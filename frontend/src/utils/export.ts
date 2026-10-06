@@ -12,22 +12,25 @@ import {
   type BackupPayload,
 } from '@/utils/db';
 import type { ResponseVerdict } from '@/types/calibration';
+import type { LoanSlip } from '@/types/loan';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
+import { buildSerialRegistry } from '@/utils/reconcile';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces', 'loans'] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, loans] = await Promise.all([
     db.arrays.toArray(),
     db.stations.toArray(),
     db.instruments.toArray(),
     db.calibrations.toArray(),
     db.replaces.toArray(),
+    db.loans.toArray(),
   ]);
   return {
     app: 'gbseisarray',
@@ -38,6 +41,7 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    loans,
   };
 }
 
@@ -55,8 +59,11 @@ export function validateBackup(input: unknown): {
   if (obj.app !== undefined && obj.app !== 'gbseisarray') {
     errors.push('app 字段应为 gbseisarray，文件来源不明');
   }
-  for (const key of BACKUP_KEYS) {
+  for (const key of ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`);
+  }
+  if (obj.loans !== undefined && !Array.isArray(obj.loans)) {
+    errors.push('loans 字段应为数组');
   }
   if (errors.length > 0) return { ok: false, errors, payload: null };
   const payload: BackupPayload = {
@@ -68,6 +75,7 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    loans: obj.loans ?? [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +88,7 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    loans: payload.loans?.length ?? 0,
   };
 }
 
@@ -117,13 +126,14 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.loans],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      if (payload.loans) await db.loans.bulkPut(payload.loans);
     }
   );
   return countPayload(payload);
@@ -160,7 +170,14 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  const loans: LoanSlip[] = (payload.loans ?? []).map((row) => ({
+    ...row,
+    id: createId('loan'),
+    lenderArrayId: arrayMap.get(row.lenderArrayId) ?? row.lenderArrayId,
+    borrowerArrayId: arrayMap.get(row.borrowerArrayId) ?? row.borrowerArrayId,
+    installStationId: row.installStationId ? stationMap.get(row.installStationId) ?? row.installStationId : null,
+  }));
+  return { ...payload, arrays, stations, instruments, calibrations, replaces, loans };
 }
 
 /** 按台阵汇总的几何与标定结论 */
@@ -175,7 +192,13 @@ export interface ArrayGeometrySummary {
   /** 由经纬度实算的孔径（最大台间距） */
   computedApertureKm: number;
   stationCount: number;
+  /** 在账台数（同一序列号只计一次，统一对账口径） */
   instrumentCount: number;
+  /** 借入 / 借出（未结）/ 在途 / 挂起台数 */
+  borrowedInCount: number;
+  lentOutCount: number;
+  inTransitCount: number;
+  suspendedCount: number;
   /** 几何中心 */
   center: { lat: number; lng: number } | null;
   /** 最大台间距的两端台站码与方位角 */
@@ -187,22 +210,38 @@ export interface ArrayGeometrySummary {
   calibrationCount: number;
   unqualifiedCount: number;
   overdueCount: number;
+  /** 按期标定率（统一对账口径，借调未归还不进超期） */
+  onScheduleRate: number;
   pendingReplaceCount: number;
   conclusion: string;
 }
 
 /** 由快照计算台阵几何与标定结论（供 /geometry 页展示） */
 export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummary[] {
-  const today = Date.now();
+  const loans = payload.loans ?? [];
+  const registry = buildSerialRegistry({
+    arrays: payload.arrays,
+    stations: payload.stations,
+    instruments: payload.instruments,
+    calibrations: payload.calibrations,
+    loans,
+  });
+
   return payload.arrays.map((array) => {
     const stations = payload.stations.filter((station) => station.arrayId === array.id);
-    const stationIds = new Set(stations.map((station) => station.id));
-    const instruments = payload.instruments.filter((instrument) => stationIds.has(instrument.stationId));
-    const instrumentIds = new Set(instruments.map((instrument) => instrument.id));
-    const calibrations = payload.calibrations.filter((calibration) =>
-      instrumentIds.has(calibration.instrumentId)
+    const ledger = registry.arrayStats.get(array.id);
+
+    // 在账仪器：以统一对账归属到本台阵的序列号为准
+    const accountInstruments = registry.entries.filter(
+      (entry) => !entry.suspended && entry.custody?.kind === 'array' && entry.custody.arrayId === array.id
     );
-    const replaces = payload.replaces.filter((replace) => instrumentIds.has(replace.instrumentId));
+    const accountInstrumentIds = new Set(
+      accountInstruments.map((entry) => entry.instrument?.id).filter((id): id is string => !!id)
+    );
+    const calibrations = payload.calibrations.filter((calibration) =>
+      accountInstrumentIds.has(calibration.instrumentId)
+    );
+    const replaces = payload.replaces.filter((replace) => accountInstrumentIds.has(replace.instrumentId));
 
     const points = stations.map((station) => ({
       id: station.id,
@@ -222,24 +261,22 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
     const unqualifiedCount = calibrations.filter(
       (calibration) => calibration.responseVerdict === '不合格'
     ).length;
-    const overdueCount = instruments.filter((instrument) => {
-      const rows = calibrations
-        .filter((calibration) => calibration.instrumentId === instrument.id)
-        .sort((a, b) => b.date.localeCompare(a.date));
-      const lastDate = rows.length > 0 ? rows[0].date : instrument.installDate;
-      const lastTime = Date.parse(`${lastDate}T00:00:00`);
-      if (!Number.isFinite(lastTime)) return true;
-      return today - lastTime > 365 * 86400000;
-    }).length;
+    // 超期台数直接取统一对账结果（借调未归还、挂起的都不含）
+    const overdueCount = ledger?.overdueCount ?? 0;
+    const accountCount = ledger?.accountCount ?? 0;
     const pendingReplaceCount = replaces.filter((replace) => replace.state !== '已复核').length;
 
     const conclusionParts: string[] = [
-      `${stations.length} 个台站、${instruments.length} 台仪器`,
+      `${stations.length} 个台站、在账 ${accountCount} 台`,
       `实算孔径 ${computed} km`,
       `累计 ${calibrations.length} 次标定`,
     ];
+    if ((ledger?.borrowedInCount ?? 0) > 0) conclusionParts.push(`借入 ${ledger?.borrowedInCount} 台`);
+    if ((ledger?.lentOutCount ?? 0) > 0) conclusionParts.push(`借出未归还 ${ledger?.lentOutCount} 台`);
+    if ((ledger?.inTransitCount ?? 0) > 0) conclusionParts.push(`在途 ${ledger?.inTransitCount} 台`);
     if (unqualifiedCount > 0) conclusionParts.push(`${unqualifiedCount} 次标定不合格`);
     if (overdueCount > 0) conclusionParts.push(`${overdueCount} 台超期未标定`);
+    if ((ledger?.suspendedCount ?? 0) > 0) conclusionParts.push(`挂起 ${ledger?.suspendedCount} 台`);
     if (pendingReplaceCount > 0) conclusionParts.push(`${pendingReplaceCount} 条更换未闭环`);
 
     return {
@@ -251,7 +288,11 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       recordedApertureKm: array.apertureKm,
       computedApertureKm: computed,
       stationCount: stations.length,
-      instrumentCount: instruments.length,
+      instrumentCount: accountCount,
+      borrowedInCount: ledger?.borrowedInCount ?? 0,
+      lentOutCount: ledger?.lentOutCount ?? 0,
+      inTransitCount: ledger?.inTransitCount ?? 0,
+      suspendedCount: ledger?.suspendedCount ?? 0,
       center,
       maxPair:
         distances.length === 0
@@ -266,6 +307,7 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       calibrationCount: calibrations.length,
       unqualifiedCount,
       overdueCount,
+      onScheduleRate: ledger?.onScheduleRate ?? 0,
       pendingReplaceCount,
       conclusion: conclusionParts.join('，'),
     };

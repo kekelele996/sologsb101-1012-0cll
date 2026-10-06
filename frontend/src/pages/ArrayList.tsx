@@ -45,10 +45,10 @@ import {
   syncStationCount,
   updateArray,
 } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { useSerialRegistry } from '@/hooks/useSerialRegistry';
 import { APERTURE_BUCKETS, ARRAY_STATES, type ArrayState, type SeisArray } from '@/types/array';
-import { apertureKm, round } from '@/utils/geo';
+import { apertureKm } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
 interface ArrayFormValues {
@@ -67,11 +67,11 @@ export default function ArrayList() {
 
   const arrays = useAppSelector(selectArrays);
   const stations = useAppSelector(selectStations);
-  const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
   const filter = useAppSelector(selectArrayFilter);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
+  const registry = useSerialRegistry();
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -121,22 +121,28 @@ export default function ArrayList() {
     });
   }, [arrays, filter]);
 
-  /** 台阵卡片统计：台站数、仪器数、标定数、不合格数与实算孔径 */
+  /** 台阵卡片统计：在账台数 / 按期标定率取统一对账口径；台站数、实算孔径取台账 */
   const cards = useMemo(
     () =>
       filtered.map((row) => {
         const arrayStations = stations.filter((station) => station.arrayId === row.id);
-        const stationIds = new Set(arrayStations.map((station) => station.id));
-        const arrayInstruments = instruments.filter((instrument) => stationIds.has(instrument.stationId));
-        const instrumentIds = new Set(arrayInstruments.map((instrument) => instrument.id));
+        const ledger = registry.arrayStats.get(row.id);
+
+        // 在账仪器（序列号同一时刻只归属一个台阵；挂起、在途均不含）
+        const accountEntries = registry.entries.filter(
+          (entry) => !entry.suspended && entry.custody?.kind === 'array' && entry.custody.arrayId === row.id
+        );
+        const accountInstrumentIds = new Set(
+          accountEntries.map((entry) => entry.instrument?.id).filter((id): id is string => !!id)
+        );
         const arrayCalibrations = calibrations.filter((calibration) =>
-          instrumentIds.has(calibration.instrumentId)
+          accountInstrumentIds.has(calibration.instrumentId)
         );
         const unqualified = arrayCalibrations.filter(
           (calibration) => calibration.responseVerdict === '不合格'
         ).length;
         const pendingReplace = replaces.filter(
-          (replace) => instrumentIds.has(replace.instrumentId) && replace.state !== '已复核'
+          (replace) => accountInstrumentIds.has(replace.instrumentId) && replace.state !== '已复核'
         ).length;
         const computed = apertureKm(
           arrayStations.map((station) => ({
@@ -149,18 +155,20 @@ export default function ArrayList() {
         return {
           row,
           stationCount: arrayStations.length,
-          instrumentCount: arrayInstruments.length,
+          instrumentCount: ledger?.accountCount ?? 0,
+          borrowedInCount: ledger?.borrowedInCount ?? 0,
+          lentOutCount: ledger?.lentOutCount ?? 0,
+          inTransitCount: ledger?.inTransitCount ?? 0,
+          suspendedCount: ledger?.suspendedCount ?? 0,
           calibrationCount: arrayCalibrations.length,
           unqualified,
           pendingReplace,
           computedApertureKm: computed,
-          qualifyRate:
-            arrayCalibrations.length === 0
-              ? 0
-              : round(((arrayCalibrations.length - unqualified) / arrayCalibrations.length) * 100, 1),
+          qualifyRate: ledger?.onScheduleRate ?? 0,
+          overdueTone: (ledger?.overdueCount ?? 0) > 0 ? 'warning' as const : 'success' as const,
         };
       }),
-    [calibrations, filtered, instruments, replaces, stations]
+    [calibrations, filtered, registry, replaces, stations]
   );
 
   const totals = useMemo(
@@ -170,6 +178,7 @@ export default function ArrayList() {
       instruments: cards.reduce((sum, card) => sum + card.instrumentCount, 0),
       unqualified: cards.reduce((sum, card) => sum + card.unqualified, 0),
       pendingReplace: cards.reduce((sum, card) => sum + card.pendingReplace, 0),
+      suspended: cards.reduce((sum, card) => sum + card.suspendedCount, 0),
     }),
     [cards]
   );
@@ -337,7 +346,7 @@ export default function ArrayList() {
       <div className="gb-stats-row">
         <StatBadge label="筛选后台阵" value={totals.arrays} suffix="个" tone="primary" />
         <StatBadge label="台站总数" value={totals.stations} suffix="个" tone="info" />
-        <StatBadge label="仪器总数" value={totals.instruments} suffix="台" tone="default" />
+        <StatBadge label="在账台数" value={totals.instruments} suffix="台" tone="default" />
         <StatBadge
           label="不合格标定"
           value={totals.unqualified}
@@ -349,6 +358,12 @@ export default function ArrayList() {
           value={totals.pendingReplace}
           suffix="条"
           tone={totals.pendingReplace > 0 ? 'warning' : 'success'}
+        />
+        <StatBadge
+          label="对账挂起"
+          value={totals.suspended}
+          suffix="台"
+          tone={totals.suspended > 0 ? 'danger' : 'success'}
         />
       </div>
 
@@ -382,13 +397,13 @@ export default function ArrayList() {
               >
                 <div className="gb-stats-row" style={{ marginBottom: 10 }}>
                   <StatBadge label="台站" value={card.stationCount} suffix="个" size="small" tone="info" />
-                  <StatBadge label="仪器" value={card.instrumentCount} suffix="台" size="small" />
+                  <StatBadge label="在账" value={card.instrumentCount} suffix="台" size="small" />
                   <StatBadge
-                    label="标定合格率"
+                    label="按期标定率"
                     value={card.qualifyRate}
                     percent={card.qualifyRate}
                     size="small"
-                    tone={card.unqualified > 0 ? 'warning' : 'success'}
+                    tone={card.overdueTone}
                   />
                 </div>
                 <Space direction="vertical" size={4} style={{ fontSize: 13, color: '#5b6b78' }}>
@@ -400,6 +415,12 @@ export default function ArrayList() {
                     累计标定 <b className="gb-mono">{card.calibrationCount}</b> 次
                     {card.unqualified > 0 ? (
                       <span className="gb-danger"> · 不合格 {card.unqualified} 次</span>
+                    ) : null}
+                  </span>
+                  <span>
+                    借入 {card.borrowedInCount} · 借出未归还 {card.lentOutCount}（其中在途 {card.inTransitCount}）
+                    {card.suspendedCount > 0 ? (
+                      <span className="gb-danger"> · 挂起 {card.suspendedCount}</span>
                     ) : null}
                   </span>
                   <span>管理部门：{card.row.department || '未填写'}</span>

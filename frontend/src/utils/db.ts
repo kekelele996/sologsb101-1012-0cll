@@ -12,9 +12,10 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { LoanSlip } from '@/types/loan';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -36,6 +37,8 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  /** 仪器周转库借调单（v3 新增，旧备份可缺省） */
+  loans?: LoanSlip[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +47,7 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  loans!: Table<LoanSlip, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,7 +62,7 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
@@ -87,6 +91,16 @@ export class SeisArrayDatabase extends Dexie {
             });
         }
       });
+
+    // v3：新增仪器周转库 loans 表（借调单），序列号/借出方/借入方/状态建索引
+    this.version(DB_VERSION).stores({
+      arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+      stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+      instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+      calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+      replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+      loans: 'id, serialNo, lenderArrayId, borrowerArrayId, state, checkoutDate, returnDate, updatedAt',
+    });
   }
 }
 
@@ -488,9 +502,79 @@ export async function seedDemoData(): Promise<void> {
     },
   ];
 
+  /**
+   * 借调演示单（周转库），刻意覆盖三种状态与统一口径：
+   * - 在借：CMG-3E-20190926-05（物理已超期，借调未归还 → 不进超期名单）；
+   * - 在途：STS25-20230902-11（已出账，接收台阵尚未登记安装位 → 两边都不在账）；
+   * - 已归还：FSS3B-20210418-02（归还后重新计入原台阵在账）。
+   * 另含一条对不上账的挂起单（台账查无此序列号，只退这一台）。
+   */
+  const loans: LoanSlip[] = [
+    {
+      id: 'loan_hx02_bb',
+      serialNo: 'CMG-3E-20190926-05',
+      lenderArrayId: 'arr_hx',
+      borrowerArrayId: 'arr_ltx',
+      state: '在借',
+      checkoutDate: daysAgo(420),
+      installDate: daysAgo(415),
+      installStationId: 'stn_ltx_03',
+      returnDate: null,
+      operator: '林之遥',
+      remark: '海西借调至龙门峡 LTX03 台，借调单未归还前不计超期',
+      createdAt: now - 420 * 86400000,
+      updatedAt: now - 415 * 86400000,
+    },
+    {
+      id: 'loan_ltx03_bb',
+      serialNo: 'STS25-20230902-11',
+      lenderArrayId: 'arr_ltx',
+      borrowerArrayId: 'arr_hx',
+      state: '在途',
+      checkoutDate: daysAgo(6),
+      installDate: null,
+      installStationId: null,
+      returnDate: null,
+      operator: '周渝',
+      remark: '已出库发往海西，接收台阵尚未登记安装位',
+      createdAt: now - 6 * 86400000,
+      updatedAt: now - 6 * 86400000,
+    },
+    {
+      id: 'loan_ltx01_st',
+      serialNo: 'FSS3B-20210418-02',
+      lenderArrayId: 'arr_ltx',
+      borrowerArrayId: 'arr_hx',
+      state: '已归还',
+      checkoutDate: daysAgo(300),
+      installDate: daysAgo(297),
+      installStationId: 'stn_hx_02',
+      returnDate: daysAgo(210),
+      operator: '陈立群',
+      remark: '施工期借调，已归还龙门峡，重新计入原台阵在账',
+      createdAt: now - 300 * 86400000,
+      updatedAt: now - 210 * 86400000,
+    },
+    {
+      id: 'loan_orphan',
+      serialNo: 'ORPHAN-20240101-99',
+      lenderArrayId: 'arr_ltx',
+      borrowerArrayId: 'arr_hx',
+      state: '在途',
+      checkoutDate: daysAgo(3),
+      installDate: null,
+      installStationId: null,
+      returnDate: null,
+      operator: '周渝',
+      remark: '周转库已出库，但台阵台账查无此序列号 → 挂起，只退这一台',
+      createdAt: now - 3 * 86400000,
+      updatedAt: now - 3 * 86400000,
+    },
+  ];
+
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.loans],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -537,6 +621,7 @@ export async function seedDemoData(): Promise<void> {
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.loans.bulkPut(loans);
     }
   );
 }
@@ -555,7 +640,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.loans],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +648,7 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.loans.clear(),
       ]);
     }
   );
@@ -576,14 +662,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, loans] = await Promise.all([
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
+    db.loans.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { arrays, stations, instruments, calibrations, replaces, loans };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

@@ -55,10 +55,10 @@ import {
   removeInstrument,
   resetDraft,
   selectInstruments,
-  selectInstrumentsOfStation,
   updateInstrument,
 } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { useSerialRegistry } from '@/hooks/useSerialRegistry';
 import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
 import {
   COMMON_MODELS,
@@ -115,6 +115,7 @@ export default function StationInstruments() {
   const allInstruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const registry = useSerialRegistry();
 
   const [stationModalOpen, setStationModalOpen] = useState(false);
   const [editingStationId, setEditingStationId] = useState<string | null>(null);
@@ -134,11 +135,22 @@ export default function StationInstruments() {
     [activeStationId, stations]
   );
 
-  const activeInstruments = useAppSelector((state) =>
-    selectInstrumentsOfStation(state, activeStationId)
-  );
+  const activeInstruments = useMemo(() => {
+    // 在账仪器：统一对账归属到当前台站安装位（借调借入计入；在途 / 挂起不含）
+    return registry.entries
+      .filter(
+        (entry) =>
+          !entry.suspended &&
+          entry.custody?.kind === 'array' &&
+          entry.custody.arrayId === arrayId &&
+          entry.custody.stationId === activeStationId
+      )
+      .map((entry) => entry.instrument)
+      .filter((instrument): instrument is Instrument => !!instrument)
+      .sort((a, b) => a.type.localeCompare(b.type, 'zh-Hans-CN') || a.model.localeCompare(b.model));
+  }, [registry, arrayId, activeStationId]);
 
-  /** 台站行：附带仪器、标定与超期统计 */
+  /** 台站行：在账仪器、标定与超期统计（统一对账口径） */
   const rows = useMemo<StationRow[]>(
     () =>
       stations
@@ -149,14 +161,27 @@ export default function StationInstruments() {
           }
           if (stationFilter.bedrocks.length > 0 && !stationFilter.bedrocks.includes(station.bedrock)) return false;
           if (stationFilter.minElevM !== null && station.elevM < stationFilter.minElevM) return false;
-          const count = allInstruments.filter((instrument) => instrument.stationId === station.id).length;
+          const count = registry.entries.filter(
+            (entry) =>
+              !entry.suspended &&
+              entry.custody?.kind === 'array' &&
+              entry.custody.arrayId === arrayId &&
+              entry.custody.stationId === station.id
+          ).length;
           if (stationFilter.onlyEmpty && count > 0) return false;
           return true;
         })
         .map((station) => {
-          const stationInstruments = allInstruments.filter(
-            (instrument) => instrument.stationId === station.id
+          const stationEntries = registry.entries.filter(
+            (entry) =>
+              !entry.suspended &&
+              entry.custody?.kind === 'array' &&
+              entry.custody.arrayId === arrayId &&
+              entry.custody.stationId === station.id
           );
+          const stationInstruments = stationEntries
+            .map((entry) => entry.instrument)
+            .filter((instrument): instrument is Instrument => !!instrument);
           const instrumentIds = new Set(stationInstruments.map((instrument) => instrument.id));
           const stationCalibrations = calibrations.filter((calibration) =>
             instrumentIds.has(calibration.instrumentId)
@@ -164,13 +189,8 @@ export default function StationInstruments() {
           const unqualified = stationCalibrations.filter(
             (calibration) => calibration.responseVerdict === '不合格'
           ).length;
-          const overdue = stationInstruments.filter((instrument) => {
-            const own = calibrations
-              .filter((calibration) => calibration.instrumentId === instrument.id)
-              .sort((a, b) => b.date.localeCompare(a.date));
-            const last = own.length > 0 ? own[0].date : instrument.installDate;
-            return daysUntilDue(last, instrument.installDate) < 0;
-          }).length;
+          // 超期只取统一对账结果（借调未归还 / 挂起都不计入）
+          const overdue = stationEntries.filter((entry) => entry.overdue).length;
           return {
             station,
             instruments: stationInstruments,
@@ -180,7 +200,7 @@ export default function StationInstruments() {
             worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
           };
         }),
-    [allInstruments, calibrations, stationFilter, stations]
+    [allInstruments, arrayId, calibrations, registry, stationFilter, stations]
   );
 
   const totals = useMemo(
@@ -639,6 +659,10 @@ export default function StationInstruments() {
                   title: '距下次标定',
                   width: 130,
                   render: (_: unknown, instrument: Instrument) => {
+                    const entry = registry.bySerial.get(instrument.serialNo);
+                    if (entry?.overdueSuspended) {
+                      return <Tag color="blue">借调未归还·缓计</Tag>;
+                    }
                     const own = calibrations
                       .filter((row) => row.instrumentId === instrument.id)
                       .sort((a, b) => b.date.localeCompare(a.date));

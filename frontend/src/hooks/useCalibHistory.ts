@@ -1,12 +1,16 @@
 /**
  * useCalibHistory：按仪器聚合历次标定、算灵敏度变化量与待标定天数。
  * 被标定记录台（/calibrations）与更换提醒页（/replacements）消费。
+ * 超期口径：借调单没归还前不进超期；借出在途 / 对账挂起的仪器不占任何台阵账，
+ * 也不进超期名单（见 types/loan.ts 统一口径）。
  */
 import { useCallback, useMemo } from 'react';
 import { useSelector } from 'react-redux';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations } from '@/stores/calibrationSlice';
+import { selectLoans } from '@/stores/loanSlice';
+import { isOnBookState, loanCoveredInstrumentIds } from '@/types/loan';
 import { calibrateDueText, sensitivityDelta, type SensitivityDelta } from '@/types/calibration';
 import { CALIBRATION_CYCLE_DAYS, daysUntilDue } from '@/types/instrument';
 import type { Calibration, ResponseVerdict } from '@/types/calibration';
@@ -56,8 +60,10 @@ export function useCalibHistory(): UseCalibHistoryResult {
   const stations = useSelector(selectStations);
   const instruments = useSelector(selectInstruments);
   const calibrations = useSelector(selectCalibrations);
+  const loans = useSelector(selectLoans);
 
   const histories = useMemo<InstrumentCalibHistory[]>(() => {
+    const loanCovered = loanCoveredInstrumentIds(loans);
     return instruments
       .map((instrument) => {
         const station = stations.find((item) => item.id === instrument.stationId);
@@ -72,6 +78,8 @@ export function useCalibHistory(): UseCalibHistoryResult {
         const worstVerdict = rows.reduce<ResponseVerdict>((worst, row) => {
           return VERDICT_ORDER[row.responseVerdict] > VERDICT_ORDER[worst] ? row.responseVerdict : worst;
         }, '合格');
+        // 超期豁免：借调单未归还，或仪器不在任何台阵账上（借出在途 / 对账挂起）
+        const exempt = loanCovered.has(instrument.id) || !isOnBookState(instrument.state);
         return {
           instrument,
           stationCode: station?.code ?? '未知台站',
@@ -82,8 +90,8 @@ export function useCalibHistory(): UseCalibHistoryResult {
           delta,
           count: rows.length,
           dueInDays,
-          overdue: dueInDays < 0,
-          pending: instrument.state === '待标定' || dueInDays < 0,
+          overdue: !exempt && dueInDays < 0,
+          pending: !exempt && (instrument.state === '待标定' || dueInDays < 0),
           worstVerdict,
           trend: [...rows]
             .reverse()
@@ -91,7 +99,7 @@ export function useCalibHistory(): UseCalibHistoryResult {
         };
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, instruments, stations]);
+  }, [arrays, calibrations, instruments, loans, stations]);
 
   const historyOf = useCallback(
     (instrumentId: string): InstrumentCalibHistory | null =>

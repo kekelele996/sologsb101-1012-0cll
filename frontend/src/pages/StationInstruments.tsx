@@ -59,9 +59,12 @@ import {
   updateInstrument,
 } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectLoans } from '@/stores/loanSlice';
+import { isOnBookState, loanCoveredInstrumentIds } from '@/types/loan';
 import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
 import {
   COMMON_MODELS,
+  INSTRUMENT_STATE_COLORS,
   INSTRUMENT_STATES,
   INSTRUMENT_TYPES,
   createEmptyInstrumentDraft,
@@ -115,6 +118,7 @@ export default function StationInstruments() {
   const allInstruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const loans = useAppSelector(selectLoans);
 
   const [stationModalOpen, setStationModalOpen] = useState(false);
   const [editingStationId, setEditingStationId] = useState<string | null>(null);
@@ -138,55 +142,62 @@ export default function StationInstruments() {
     selectInstrumentsOfStation(state, activeStationId)
   );
 
-  /** 台站行：附带仪器、标定与超期统计 */
-  const rows = useMemo<StationRow[]>(
-    () =>
-      stations
-        .filter((station) => {
-          const keyword = stationFilter.keyword.trim();
-          if (keyword.length > 0 && !`${station.code}${station.bedrock}${station.siteNote}`.includes(keyword)) {
-            return false;
-          }
-          if (stationFilter.bedrocks.length > 0 && !stationFilter.bedrocks.includes(station.bedrock)) return false;
-          if (stationFilter.minElevM !== null && station.elevM < stationFilter.minElevM) return false;
-          const count = allInstruments.filter((instrument) => instrument.stationId === station.id).length;
-          if (stationFilter.onlyEmpty && count > 0) return false;
-          return true;
-        })
-        .map((station) => {
-          const stationInstruments = allInstruments.filter(
-            (instrument) => instrument.stationId === station.id
-          );
-          const instrumentIds = new Set(stationInstruments.map((instrument) => instrument.id));
-          const stationCalibrations = calibrations.filter((calibration) =>
-            instrumentIds.has(calibration.instrumentId)
-          );
-          const unqualified = stationCalibrations.filter(
-            (calibration) => calibration.responseVerdict === '不合格'
-          ).length;
-          const overdue = stationInstruments.filter((instrument) => {
-            const own = calibrations
-              .filter((calibration) => calibration.instrumentId === instrument.id)
-              .sort((a, b) => b.date.localeCompare(a.date));
-            const last = own.length > 0 ? own[0].date : instrument.installDate;
-            return daysUntilDue(last, instrument.installDate) < 0;
-          }).length;
-          return {
-            station,
-            instruments: stationInstruments,
-            calibrationCount: stationCalibrations.length,
-            unqualified,
-            overdue,
-            worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
-          };
-        }),
-    [allInstruments, calibrations, stationFilter, stations]
-  );
+  /** 台站行：附带仪器、标定与超期统计（超期豁免未归还借调，口径见 types/loan.ts） */
+  const rows = useMemo<StationRow[]>(() => {
+    const loanCovered = loanCoveredInstrumentIds(loans);
+    return stations
+      .filter((station) => {
+        const keyword = stationFilter.keyword.trim();
+        if (keyword.length > 0 && !`${station.code}${station.bedrock}${station.siteNote}`.includes(keyword)) {
+          return false;
+        }
+        if (stationFilter.bedrocks.length > 0 && !stationFilter.bedrocks.includes(station.bedrock)) return false;
+        if (stationFilter.minElevM !== null && station.elevM < stationFilter.minElevM) return false;
+        const count = allInstruments.filter((instrument) => instrument.stationId === station.id).length;
+        if (stationFilter.onlyEmpty && count > 0) return false;
+        return true;
+      })
+      .map((station) => {
+        const stationInstruments = allInstruments.filter(
+          (instrument) => instrument.stationId === station.id
+        );
+        const instrumentIds = new Set(stationInstruments.map((instrument) => instrument.id));
+        const stationCalibrations = calibrations.filter((calibration) =>
+          instrumentIds.has(calibration.instrumentId)
+        );
+        const unqualified = stationCalibrations.filter(
+          (calibration) => calibration.responseVerdict === '不合格'
+        ).length;
+        const overdue = stationInstruments.filter((instrument) => {
+          if (!isOnBookState(instrument.state) || loanCovered.has(instrument.id)) return false;
+          const own = calibrations
+            .filter((calibration) => calibration.instrumentId === instrument.id)
+            .sort((a, b) => b.date.localeCompare(a.date));
+          const last = own.length > 0 ? own[0].date : instrument.installDate;
+          return daysUntilDue(last, instrument.installDate) < 0;
+        }).length;
+        return {
+          station,
+          instruments: stationInstruments,
+          calibrationCount: stationCalibrations.length,
+          unqualified,
+          overdue,
+          worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
+        };
+      });
+  }, [allInstruments, calibrations, loans, stationFilter, stations]);
 
   const totals = useMemo(
     () => ({
       stations: rows.length,
-      instruments: rows.reduce((sum, row) => sum + row.instruments.length, 0),
+      instruments: rows.reduce(
+        (sum, row) => sum + row.instruments.filter((instrument) => isOnBookState(instrument.state)).length,
+        0
+      ),
+      offBook: rows.reduce(
+        (sum, row) => sum + row.instruments.filter((instrument) => !isOnBookState(instrument.state)).length,
+        0
+      ),
       calibrations: rows.reduce((sum, row) => sum + row.calibrationCount, 0),
       unqualified: rows.reduce((sum, row) => sum + row.unqualified, 0),
       overdue: rows.reduce((sum, row) => sum + row.overdue, 0),
@@ -407,7 +418,14 @@ export default function StationInstruments() {
 
       <div className="gb-stats-row">
         <StatBadge label="台站数" value={totals.stations} suffix="个" tone="info" />
-        <StatBadge label="仪器台数" value={totals.instruments} suffix="台" tone="primary" />
+        <StatBadge label="在账仪器" value={totals.instruments} suffix="台" tone="primary" tip="借出在途与对账挂起不占账" />
+        <StatBadge
+          label="账外（借出/挂起）"
+          value={totals.offBook}
+          suffix="台"
+          tone={totals.offBook > 0 ? 'warning' : 'default'}
+          tip="借出在途与对账挂起的仪器，归仪器周转库处置"
+        />
         <StatBadge label="累计标定" value={totals.calibrations} suffix="次" tone="default" />
         <StatBadge
           label="不合格标定"
@@ -420,6 +438,7 @@ export default function StationInstruments() {
           value={totals.overdue}
           suffix="台"
           tone={totals.overdue > 0 ? 'warning' : 'success'}
+          tip="借调单没归还前不进超期"
         />
       </div>
 
@@ -601,8 +620,8 @@ export default function StationInstruments() {
                   title: '状态',
                   dataIndex: 'state',
                   width: 100,
-                  render: (value: string) => (
-                    <Tag color={value === '在用' ? 'green' : value === '待标定' ? 'orange' : 'default'}>{value}</Tag>
+                  render: (value: InstrumentState) => (
+                    <Tag color={INSTRUMENT_STATE_COLORS[value]}>{value}</Tag>
                   ),
                 },
                 {
@@ -639,6 +658,12 @@ export default function StationInstruments() {
                   title: '距下次标定',
                   width: 130,
                   render: (_: unknown, instrument: Instrument) => {
+                    if (!isOnBookState(instrument.state)) {
+                      return <span className="gb-hint">账外（借出/挂起）</span>;
+                    }
+                    if (loanCoveredInstrumentIds(loans).has(instrument.id)) {
+                      return <span className="gb-hint">借调中，暂缓考核</span>;
+                    }
                     const own = calibrations
                       .filter((row) => row.instrumentId === instrument.id)
                       .sort((a, b) => b.date.localeCompare(a.date));

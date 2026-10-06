@@ -12,9 +12,10 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { Loan } from '@/types/loan';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -36,6 +37,7 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  loans: Loan[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +46,7 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  loans!: Table<Loan, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,7 +61,7 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
@@ -87,6 +90,12 @@ export class SeisArrayDatabase extends Dexie {
             });
         }
       });
+
+    // v3：新增仪器周转库（借调单）表；仪器状态扩展「借出在途 / 对账挂起」为纯状态值，无需回填
+    this.version(DB_VERSION).stores({
+      loans:
+        'id, code, serialNo, instrumentId, fromArrayId, fromStationId, toArrayId, toStationId, state, outDate, updatedAt',
+    });
   }
 }
 
@@ -162,8 +171,8 @@ interface SeedArray {
 }
 
 /**
- * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换，
- * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本。
+ * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换 + 3 条借调，
+ * 覆盖「在用 / 待标定 / 已停用 / 借出在途」与「合格 / 不合格」以及超期未标定样本。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now();
@@ -257,13 +266,14 @@ export async function seedDemoData(): Promise<void> {
           instruments: [
             {
               id: 'ins_ltx02_bb',
-              stationId: 'stn_ltx_02',
+              // 借出至海西台阵并已在 HX02 登位（借调单 loan_seed_recv），安装位随迁、安装日期按登位日重计
+              stationId: 'stn_hx_02',
               type: '宽频带',
               model: 'Trillium-120',
               serialNo: 'T120-20220315-07',
-              installDate: '2022-03-15',
+              installDate: daysAgo(10),
               state: '在用',
-              remark: '井下安装，深度 42 m',
+              remark: '井下安装，深度 42 m；施工期借调海西台阵',
               calibrations: [
                 {
                   id: 'cal_ltx02_bb_1',
@@ -394,8 +404,9 @@ export async function seedDemoData(): Promise<void> {
               model: 'ES-T',
               serialNo: 'EST-20190925-04',
               installDate: '2019-09-25',
-              state: '在用',
-              remark: '结构台阵强震观测',
+              // 已出库借往龙门峡台阵（借调单 loan_seed_transit），在途不占任何台阵账
+              state: '借出在途',
+              remark: '结构台阵强震观测；施工期借出，在途',
               calibrations: [
                 {
                   id: 'cal_hx01_sm_1',
@@ -488,9 +499,77 @@ export async function seedDemoData(): Promise<void> {
     },
   ];
 
+  /**
+   * 演示借调单：在途 / 已接收 / 已归还各一条，与上方仪器状态联动——
+   * ins_hx01_sm 出库在途（不占任何台阵账）、ins_ltx02_bb 已被海西接收登位（计海西在账）、
+   * ins_hx02_bb 借出后已归还（回到原台阵账上）。
+   */
+  const loans: Loan[] = [
+    {
+      id: 'loan_seed_transit',
+      code: 'JD-20260916-01',
+      serialNo: 'EST-20190925-04',
+      instrumentId: 'ins_hx01_sm',
+      fromArrayId: 'arr_hx',
+      fromStationId: 'stn_hx_01',
+      toArrayId: 'arr_ltx',
+      toStationId: null,
+      outDate: daysAgo(20),
+      receiveDate: null,
+      returnDate: null,
+      state: '在途',
+      holdFromState: null,
+      holdReason: '',
+      operator: '周渝',
+      remark: '龙门峡施工期加密观测借调，出库即出账',
+      createdAt: now - 20 * 86400000,
+      updatedAt: now - 20 * 86400000,
+    },
+    {
+      id: 'loan_seed_recv',
+      code: 'JD-20260906-02',
+      serialNo: 'T120-20220315-07',
+      instrumentId: 'ins_ltx02_bb',
+      fromArrayId: 'arr_ltx',
+      fromStationId: 'stn_ltx_02',
+      toArrayId: 'arr_hx',
+      toStationId: 'stn_hx_02',
+      outDate: daysAgo(30),
+      receiveDate: daysAgo(10),
+      returnDate: null,
+      state: '已接收',
+      holdFromState: null,
+      holdReason: '',
+      operator: '林之遥',
+      remark: '海西 HX02 增补宽频带，已登安装位；未归还前不进超期',
+      createdAt: now - 30 * 86400000,
+      updatedAt: now - 10 * 86400000,
+    },
+    {
+      id: 'loan_seed_returned',
+      code: 'JD-20260708-03',
+      serialNo: 'CMG-3E-20190926-05',
+      instrumentId: 'ins_hx02_bb',
+      fromArrayId: 'arr_hx',
+      fromStationId: 'stn_hx_02',
+      toArrayId: 'arr_ltx',
+      toStationId: 'stn_ltx_03',
+      outDate: daysAgo(90),
+      receiveDate: daysAgo(80),
+      returnDate: daysAgo(45),
+      state: '已归还',
+      holdFromState: null,
+      holdReason: '',
+      operator: '陈立群',
+      remark: '龙门峡 LTX03 临时观测结束，已归还原安装位',
+      createdAt: now - 90 * 86400000,
+      updatedAt: now - 45 * 86400000,
+    },
+  ];
+
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.loans],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -537,6 +616,7 @@ export async function seedDemoData(): Promise<void> {
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.loans.bulkPut(loans);
     }
   );
 }
@@ -555,7 +635,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.loans],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +643,7 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.loans.clear(),
       ]);
     }
   );
@@ -576,14 +657,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, loans] = await Promise.all([
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
+    db.loans.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { arrays, stations, instruments, calibrations, replaces, loans };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

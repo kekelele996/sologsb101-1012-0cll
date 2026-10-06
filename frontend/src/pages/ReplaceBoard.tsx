@@ -45,6 +45,8 @@ import {
   transitionReplace,
   updateReplace,
 } from '@/stores/calibrationSlice';
+import { selectLoans } from '@/stores/loanSlice';
+import { isOnBookState, loanCoveredInstrumentIds } from '@/types/loan';
 import {
   REPLACE_REASON_TEMPLATES,
   REPLACE_STATES,
@@ -52,7 +54,7 @@ import {
   type Replace,
   type ReplaceState,
 } from '@/types/replace';
-import { daysUntilDue, type Instrument } from '@/types/instrument';
+import { daysUntilDue, INSTRUMENT_STATE_COLORS, type Instrument } from '@/types/instrument';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
 
@@ -90,6 +92,7 @@ export default function ReplaceBoard() {
   const arrays = useAppSelector(selectArrays);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const loans = useAppSelector(selectLoans);
   const filter = useAppSelector(selectReplaceFilter);
   const { histories } = useCalibHistory();
 
@@ -102,9 +105,11 @@ export default function ReplaceBoard() {
     if (arrays.length === 0) void initDatabase();
   }, [arrays.length]);
 
-  /** 仪器评定行：结合标定结论与更换记录 */
+  /** 仪器评定行：结合标定结论与更换记录；只评在账仪器（借出在途 / 对账挂起归周转库处置） */
   const rows = useMemo<AssessmentRow[]>(() => {
+    const loanCovered = loanCoveredInstrumentIds(loans);
     return instruments
+      .filter((instrument) => isOnBookState(instrument.state))
       .map((instrument) => {
         const station = stations.find((row) => row.id === instrument.stationId);
         const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
@@ -125,7 +130,8 @@ export default function ReplaceBoard() {
           arrayName: array?.name ?? '未知台阵',
           lastDate,
           dueInDays,
-          overdue: dueInDays < 0,
+          // 借调单没归还前不进超期名单
+          overdue: dueInDays < 0 && !loanCovered.has(instrument.id),
           lastVerdict: latest ? latest.responseVerdict : '待判定',
           calibrationCount: own.length,
           replace,
@@ -145,17 +151,24 @@ export default function ReplaceBoard() {
         return true;
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, filter, instruments, replaces, stations]);
+  }, [arrays, calibrations, filter, instruments, loans, replaces, stations]);
 
   const totals = useMemo(() => {
     const overdue = rows.filter((row) => row.overdue).length;
     const unqualified = rows.filter((row) => row.lastVerdict === '不合格').length;
     const pendingReplace = replaces.filter((row) => row.state === '待更换').length;
     const closedReplace = replaces.filter((row) => row.state === '已复核').length;
+    // 按期标定率与在账台数同一条口径：分母只含在账仪器，超期分子已豁免未归还借调
     const cycleRate =
       rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
     return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
   }, [replaces, rows]);
+
+  /** 账外仪器：借出在途 + 对账挂起（归周转库与对账处置，不进本页评定） */
+  const offBookCount = useMemo(
+    () => instruments.filter((instrument) => !isOnBookState(instrument.state)).length,
+    [instruments]
+  );
 
   const replaceRows = useMemo(
     () =>
@@ -179,8 +192,9 @@ export default function ReplaceBoard() {
   const openCreate = (instrumentId?: string) => {
     setEditingId(null);
     const defaultReason = REPLACE_REASON_TEMPLATES[0].reason;
+    const firstOnBook = instruments.find((instrument) => isOnBookState(instrument.state));
     form.setFieldsValue({
-      instrumentId: instrumentId ?? instruments[0]?.id ?? '',
+      instrumentId: instrumentId ?? firstOnBook?.id ?? '',
       reason: defaultReason,
       newSerialNo: '',
       date: dayjs(),
@@ -276,12 +290,13 @@ export default function ReplaceBoard() {
       </div>
 
       <div className="gb-stats-row">
-        <StatBadge label="仪器台数" value={totals.instruments} suffix="台" tone="primary" />
+        <StatBadge label="在账仪器" value={totals.instruments} suffix="台" tone="primary" tip="借出在途与对账挂起不占账，不在本页评定" />
         <StatBadge
           label="超期未标定"
           value={totals.overdue}
           suffix="台"
           tone={totals.overdue > 0 ? 'danger' : 'success'}
+          tip="借调单没归还前不进超期"
         />
         <StatBadge
           label="结论不合格"
@@ -293,6 +308,14 @@ export default function ReplaceBoard() {
         <StatBadge label="待更换" value={totals.pendingReplace} suffix="条" tone="warning" />
         <StatBadge label="已复核" value={totals.closedReplace} suffix="条" tone="info" />
       </div>
+
+      {offBookCount > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          message={`另有 ${offBookCount} 台仪器借出在途或对账挂起，不占任何台阵账，未纳入本页评定与按期标定率；请到「仪器周转库」查看借调单与对账处置。`}
+        />
+      ) : null}
 
       {overdueHistories.length > 0 ? (
         <Alert
@@ -398,9 +421,7 @@ export default function ReplaceBoard() {
               title: '仪器状态',
               width: 110,
               render: (_: unknown, row: AssessmentRow) => (
-                <Tag color={row.instrument.state === '在用' ? 'green' : row.instrument.state === '待标定' ? 'orange' : 'default'}>
-                  {row.instrument.state}
-                </Tag>
+                <Tag color={INSTRUMENT_STATE_COLORS[row.instrument.state]}>{row.instrument.state}</Tag>
               ),
             },
             {
@@ -555,13 +576,15 @@ export default function ReplaceBoard() {
             <Select
               showSearch
               optionFilterProp="label"
-              options={instruments.map((instrument) => {
-                const station = stations.find((row) => row.id === instrument.stationId);
-                return {
-                  label: `${station?.code ?? ''} · ${instrument.model}（${instrument.serialNo}）`,
-                  value: instrument.id,
-                };
-              })}
+              options={instruments
+                .filter((instrument) => isOnBookState(instrument.state))
+                .map((instrument) => {
+                  const station = stations.find((row) => row.id === instrument.stationId);
+                  return {
+                    label: `${station?.code ?? ''} · ${instrument.model}（${instrument.serialNo}）`,
+                    value: instrument.id,
+                  };
+                })}
             />
           </Form.Item>
           <Form.Item name="reason" label="更换原因" rules={[{ required: true, message: '请填写更换原因' }]}>

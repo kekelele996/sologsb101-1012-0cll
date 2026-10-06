@@ -12,22 +12,24 @@ import {
   type BackupPayload,
 } from '@/utils/db';
 import type { ResponseVerdict } from '@/types/calibration';
+import { isOnBookState, loanCoveredInstrumentIds } from '@/types/loan';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces', 'loans'] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, loans] = await Promise.all([
     db.arrays.toArray(),
     db.stations.toArray(),
     db.instruments.toArray(),
     db.calibrations.toArray(),
     db.replaces.toArray(),
+    db.loans.toArray(),
   ]);
   return {
     app: 'gbseisarray',
@@ -38,6 +40,7 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    loans,
   };
 }
 
@@ -56,6 +59,8 @@ export function validateBackup(input: unknown): {
     errors.push('app 字段应为 gbseisarray，文件来源不明');
   }
   for (const key of BACKUP_KEYS) {
+    // loans 为 v3 新增表：老备份没有该字段时按空数组兼容，不视为错误
+    if (key === 'loans' && obj.loans === undefined) continue;
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`);
   }
   if (errors.length > 0) return { ok: false, errors, payload: null };
@@ -68,6 +73,7 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    loans: obj.loans ?? [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +86,7 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    loans: payload.loans.length,
   };
 }
 
@@ -117,13 +124,14 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.loans],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.loans.bulkPut(payload.loans);
     }
   );
   return countPayload(payload);
@@ -160,7 +168,16 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  const loans = payload.loans.map((row) => ({
+    ...row,
+    id: createId('loan'),
+    instrumentId: row.instrumentId ? instrumentMap.get(row.instrumentId) ?? row.instrumentId : null,
+    fromArrayId: arrayMap.get(row.fromArrayId) ?? row.fromArrayId,
+    fromStationId: stationMap.get(row.fromStationId) ?? row.fromStationId,
+    toArrayId: arrayMap.get(row.toArrayId) ?? row.toArrayId,
+    toStationId: row.toStationId ? stationMap.get(row.toStationId) ?? row.toStationId : null,
+  }));
+  return { ...payload, arrays, stations, instruments, calibrations, replaces, loans };
 }
 
 /** 按台阵汇总的几何与标定结论 */
@@ -191,13 +208,16 @@ export interface ArrayGeometrySummary {
   conclusion: string;
 }
 
-/** 由快照计算台阵几何与标定结论（供 /geometry 页展示） */
+/** 由快照计算台阵几何与标定结论（供 /geometry 页展示）；在账与超期口径同 types/loan.ts */
 export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummary[] {
   const today = Date.now();
+  const loanCovered = loanCoveredInstrumentIds(payload.loans);
   return payload.arrays.map((array) => {
     const stations = payload.stations.filter((station) => station.arrayId === array.id);
     const stationIds = new Set(stations.map((station) => station.id));
     const instruments = payload.instruments.filter((instrument) => stationIds.has(instrument.stationId));
+    // 在账口径：借出在途与对账挂起不占任何台阵账（出库即出账）
+    const onBookInstruments = instruments.filter((instrument) => isOnBookState(instrument.state));
     const instrumentIds = new Set(instruments.map((instrument) => instrument.id));
     const calibrations = payload.calibrations.filter((calibration) =>
       instrumentIds.has(calibration.instrumentId)
@@ -222,7 +242,9 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
     const unqualifiedCount = calibrations.filter(
       (calibration) => calibration.responseVerdict === '不合格'
     ).length;
-    const overdueCount = instruments.filter((instrument) => {
+    // 超期名单：只在账仪器参与评定，借调单没归还前不进超期
+    const overdueCount = onBookInstruments.filter((instrument) => {
+      if (loanCovered.has(instrument.id)) return false;
       const rows = calibrations
         .filter((calibration) => calibration.instrumentId === instrument.id)
         .sort((a, b) => b.date.localeCompare(a.date));
@@ -234,7 +256,7 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
     const pendingReplaceCount = replaces.filter((replace) => replace.state !== '已复核').length;
 
     const conclusionParts: string[] = [
-      `${stations.length} 个台站、${instruments.length} 台仪器`,
+      `${stations.length} 个台站、在账 ${onBookInstruments.length} 台仪器`,
       `实算孔径 ${computed} km`,
       `累计 ${calibrations.length} 次标定`,
     ];
@@ -251,7 +273,7 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       recordedApertureKm: array.apertureKm,
       computedApertureKm: computed,
       stationCount: stations.length,
-      instrumentCount: instruments.length,
+      instrumentCount: onBookInstruments.length,
       center,
       maxPair:
         distances.length === 0

@@ -60,11 +60,11 @@ export const updateArray = createAsyncThunk(
   }
 );
 
-/** 删除台阵：级联删除台站、仪器、标定与更换记录 */
+/** 删除台阵：级联删除台站、仪器、标定、更换与借调单记录 */
 export const removeArray = createAsyncThunk('array/removeArray', async (arrayId: string) => {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.loans],
     async () => {
       const stationIds = (await db.stations.where('arrayId').equals(arrayId).toArray()).map(
         (row) => row.id
@@ -76,10 +76,16 @@ export const removeArray = createAsyncThunk('array/removeArray', async (arrayId:
         if (instrumentIds.length > 0) {
           await db.calibrations.where('instrumentId').anyOf(instrumentIds).delete();
           await db.replaces.where('instrumentId').anyOf(instrumentIds).delete();
+          await db.loans.where('instrumentId').anyOf(instrumentIds).delete();
           await db.instruments.bulkDelete(instrumentIds);
         }
+        // 借调单引用的安装位（借出 / 接收台站）随台站一起清理
+        await db.loans.where('fromStationId').anyOf(stationIds).delete();
+        await db.loans.where('toStationId').anyOf(stationIds).delete();
         await db.stations.bulkDelete(stationIds);
       }
+      await db.loans.where('fromArrayId').equals(arrayId).delete();
+      await db.loans.where('toArrayId').equals(arrayId).delete();
       await db.arrays.delete(arrayId);
     }
   );
@@ -104,17 +110,20 @@ export const updateStation = createAsyncThunk(
   }
 );
 
-/** 删除台站：级联删除仪器、标定与更换记录 */
+/** 删除台站：级联删除仪器、标定、更换与借调单记录 */
 export const removeStation = createAsyncThunk('array/removeStation', async (stationId: string) => {
-  await db.transaction('rw', [db.stations, db.instruments, db.calibrations, db.replaces], async () => {
+  await db.transaction('rw', [db.stations, db.instruments, db.calibrations, db.replaces, db.loans], async () => {
     const instrumentIds = (
       await db.instruments.where('stationId').equals(stationId).toArray()
     ).map((row) => row.id);
     if (instrumentIds.length > 0) {
       await db.calibrations.where('instrumentId').anyOf(instrumentIds).delete();
       await db.replaces.where('instrumentId').anyOf(instrumentIds).delete();
+      await db.loans.where('instrumentId').anyOf(instrumentIds).delete();
       await db.instruments.bulkDelete(instrumentIds);
     }
+    await db.loans.where('fromStationId').equals(stationId).delete();
+    await db.loans.where('toStationId').equals(stationId).delete();
     await db.stations.delete(stationId);
   });
   return stationId;

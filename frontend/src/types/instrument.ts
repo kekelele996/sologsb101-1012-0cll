@@ -3,10 +3,24 @@ export type InstrumentType = '宽频带' | '短周期' | '强震';
 
 export const INSTRUMENT_TYPES: InstrumentType[] = ['宽频带', '短周期', '强震'];
 
-/** 仪器状态 */
-export type InstrumentState = '在用' | '待标定' | '已停用';
+/**
+ * 仪器状态。
+ * 「借出在途」「对账挂起」由周转库借调单与对账处置驱动，不开放手工登记；
+ * 这两种状态不计入任何台阵在账（出库即出账，见 types/loan.ts 统一口径）。
+ */
+export type InstrumentState = '在用' | '待标定' | '已停用' | '借出在途' | '对账挂起';
 
+/** 登记表单可选的状态（驱动型状态不在其列） */
 export const INSTRUMENT_STATES: InstrumentState[] = ['在用', '待标定', '已停用'];
+
+/** 状态标签颜色（Ant Design Tag color），各页面统一渲染 */
+export const INSTRUMENT_STATE_COLORS: Record<InstrumentState, string> = {
+  在用: 'green',
+  待标定: 'orange',
+  已停用: 'default',
+  借出在途: 'blue',
+  对账挂起: 'red',
+};
 
 /** 标定周期（天）：超过该天数未标定即视为超期 */
 export const CALIBRATION_CYCLE_DAYS = 365;

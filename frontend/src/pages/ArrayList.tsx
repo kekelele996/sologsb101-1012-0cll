@@ -47,6 +47,7 @@ import {
 } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { isOnBookState } from '@/types/loan';
 import { APERTURE_BUCKETS, ARRAY_STATES, type ArrayState, type SeisArray } from '@/types/array';
 import { apertureKm, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
@@ -121,13 +122,16 @@ export default function ArrayList() {
     });
   }, [arrays, filter]);
 
-  /** 台阵卡片统计：台站数、仪器数、标定数、不合格数与实算孔径 */
+  /** 台阵卡片统计：台站数、在账仪器数、标定数、不合格数与实算孔径（在账口径见 types/loan.ts） */
   const cards = useMemo(
     () =>
       filtered.map((row) => {
         const arrayStations = stations.filter((station) => station.arrayId === row.id);
         const stationIds = new Set(arrayStations.map((station) => station.id));
         const arrayInstruments = instruments.filter((instrument) => stationIds.has(instrument.stationId));
+        // 在账台数：借出在途与对账挂起不占任何台阵账（出库即出账）
+        const onBookInstruments = arrayInstruments.filter((instrument) => isOnBookState(instrument.state));
+        const offBookCount = arrayInstruments.length - onBookInstruments.length;
         const instrumentIds = new Set(arrayInstruments.map((instrument) => instrument.id));
         const arrayCalibrations = calibrations.filter((calibration) =>
           instrumentIds.has(calibration.instrumentId)
@@ -149,7 +153,8 @@ export default function ArrayList() {
         return {
           row,
           stationCount: arrayStations.length,
-          instrumentCount: arrayInstruments.length,
+          instrumentCount: onBookInstruments.length,
+          offBookCount,
           calibrationCount: arrayCalibrations.length,
           unqualified,
           pendingReplace,
@@ -382,7 +387,13 @@ export default function ArrayList() {
               >
                 <div className="gb-stats-row" style={{ marginBottom: 10 }}>
                   <StatBadge label="台站" value={card.stationCount} suffix="个" size="small" tone="info" />
-                  <StatBadge label="仪器" value={card.instrumentCount} suffix="台" size="small" />
+                  <StatBadge
+                    label="在账仪器"
+                    value={card.instrumentCount}
+                    suffix="台"
+                    size="small"
+                    tip={card.offBookCount > 0 ? `另有 ${card.offBookCount} 台借出在途或对账挂起，不占本台阵账` : '借出在途与对账挂起不占账'}
+                  />
                   <StatBadge
                     label="标定合格率"
                     value={card.qualifyRate}

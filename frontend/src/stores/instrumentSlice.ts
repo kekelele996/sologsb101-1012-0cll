@@ -49,7 +49,12 @@ export const createInstrument = createAsyncThunk(
   ) => {
     const conflict = await findSerialConflict(payload.serialNo);
     if (conflict) {
-      return rejectWithValue(`序列号「${payload.serialNo}」已被仪器 ${conflict.model} 占用`);
+      // 借出在途的仪器不能被接收台阵重复建档：请到周转库走「接收登位」完成转隶
+      const hint =
+        conflict.state === '借出在途' || conflict.state === '对账挂起'
+          ? `；该序列号当前「${conflict.state}」，请到「仪器周转库」按借调单接收登位或处理对账挂起`
+          : '';
+      return rejectWithValue(`序列号「${payload.serialNo}」已被仪器 ${conflict.model} 占用${hint}`);
     }
     const now = Date.now();
     const row: Instrument = { ...payload, id: createId('ins'), createdAt: now, updatedAt: now };
@@ -77,13 +82,14 @@ export const updateInstrument = createAsyncThunk(
   }
 );
 
-/** 删除仪器：级联删除标定与更换记录 */
+/** 删除仪器：级联删除标定、更换与借调单记录 */
 export const removeInstrument = createAsyncThunk(
   'instrument/removeInstrument',
   async (instrumentId: string) => {
-    await db.transaction('rw', [db.instruments, db.calibrations, db.replaces], async () => {
+    await db.transaction('rw', [db.instruments, db.calibrations, db.replaces, db.loans], async () => {
       await db.calibrations.where('instrumentId').equals(instrumentId).delete();
       await db.replaces.where('instrumentId').equals(instrumentId).delete();
+      await db.loans.where('instrumentId').equals(instrumentId).delete();
       await db.instruments.delete(instrumentId);
     });
     return instrumentId;
